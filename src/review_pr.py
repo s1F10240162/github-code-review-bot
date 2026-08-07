@@ -44,9 +44,13 @@ def get_pr_details(repo, pr_number, token):
 
     return title, body, diff_content
 
-def generate_review(title, pr_body, diff_content, model_name, api_key):
-    """OpenAI APIを呼び出してコードレビュー結果を生成します。"""
-    client = OpenAI(api_key=api_key)
+def generate_review(title, pr_body, diff_content, model_name, api_key, base_url=None):
+    """OpenAI API（または大学等のプロキシAPI）を呼び出してコードレビュー結果を生成します。"""
+    if base_url:
+        print(f"カスタムBase URLを使用中: {base_url}")
+        client = OpenAI(api_key=api_key, base_url=base_url)
+    else:
+        client = OpenAI(api_key=api_key)
 
     is_truncated = False
     if len(diff_content) > MAX_DIFF_LENGTH:
@@ -80,7 +84,7 @@ def generate_review(title, pr_body, diff_content, model_name, api_key):
 ```
 """
 
-    print(f"OpenAIモデル '{model_name}' を使用してレビューを生成中...")
+    print(f"モデル '{model_name}' を使用してレビューを生成中...")
 
     try:
         response = client.chat.completions.create(
@@ -121,6 +125,7 @@ def post_comment_to_pr(repo, pr_number, token, comment_body):
 
 def main():
     openai_api_key = get_env_variable("OPENAI_API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL")
     github_token = get_env_variable("GITHUB_TOKEN")
     github_repository = get_env_variable("GITHUB_REPOSITORY")
     
@@ -151,7 +156,8 @@ def main():
         print("差分が見つからないため、レビューをスキップします。")
         sys.exit(0)
 
-    review_result = generate_review(title, pr_body, diff_content, model_name, openai_api_key)
+    review_result = generate_review(title, pr_body, diff_content, model_name, openai_api_key, openai_base_url)
+    post_comment_to_pr(github_repository, pr_number, github_token, review_result)
     post_comment_to_pr(github_repository, pr_number, github_token, review_result)
 
 if __name__ == "__main__":
