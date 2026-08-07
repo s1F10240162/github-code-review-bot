@@ -3,6 +3,10 @@ name: AI Code Reviewer (OpenAI)
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_call:
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 jobs:
   review:
@@ -14,8 +18,14 @@ jobs:
       issues: write
 
     steps:
-      - name: Checkout Code
+      - name: Checkout Target Repository
         uses: actions/checkout@v4
+
+      - name: Checkout BOT Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 's1F10240162/github-code-review-bot'
+          path: '.github-code-review-bot'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,7 +35,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r .github-code-review-bot/requirements.txt
 
       - name: Run AI Code Review
         env:
@@ -35,4 +45,5 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           OPENAI_MODEL: 'gpt-4o-mini'
         run: |
-          python src/review_pr.py
+          python .github-code-review-bot/src/review_pr.py
+
