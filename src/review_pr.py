@@ -125,7 +125,7 @@ def post_comment_to_pr(repo, pr_number, token, comment_body):
 
 def main():
     openai_api_key = get_env_variable("OPENAI_API_KEY")
-    openai_base_url = os.getenv("OPENAI_BASE_URL")
+    openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.iniad.org/api/v1")
     github_token = get_env_variable("GITHUB_TOKEN")
     github_repository = get_env_variable("GITHUB_REPOSITORY")
     
@@ -149,6 +149,7 @@ def main():
     print(f"リポジトリ: {github_repository}")
     print(f"PR番号: #{pr_number}")
     print(f"使用モデル: {model_name}")
+    print(f"Base URL: {openai_base_url}")
 
     title, pr_body, diff_content = get_pr_details(github_repository, pr_number, github_token)
     
@@ -157,7 +158,6 @@ def main():
         sys.exit(0)
 
     review_result = generate_review(title, pr_body, diff_content, model_name, openai_api_key, openai_base_url)
-    post_comment_to_pr(github_repository, pr_number, github_token, review_result)
     post_comment_to_pr(github_repository, pr_number, github_token, review_result)
 
 if __name__ == "__main__":
