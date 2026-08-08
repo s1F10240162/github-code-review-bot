@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import subprocess
 import requests
 from openai import OpenAI
 
@@ -87,8 +88,9 @@ def get_repo_tree(repo, token, ref):
 def analyze_diff(diff_content):
     """
     Diffを解析し、
-    (1) インラインコメント可能な (ファイルパス, 新ファイル側の行番号) の集合
-    (2) 行番号付きでAIに提示するための整形済みテキスト
+    (1) インラインコメント可能な (ファイルパス, 新ファイル側の行番号) の集合 (file_line_map)
+    (2) このPRで実際に追加された行だけの集合 (added_line_map、静的解析結果の絞り込みに使用)
+    (3) 行番号付きでAIに提示するための整形済みテキスト
     を作成します。行番号は新ファイル側 (追加行・変更なしの周辺行) のみ付与され、
     削除された行にはコメントできないため番号を付けません。
     """
@@ -97,22 +99,25 @@ def analyze_diff(diff_content):
         diff_content = diff_content[:MAX_DIFF_LENGTH]
 
     file_line_map = {}
+    added_line_map = {}
     annotated_blocks = []
 
     current_file = None
     current_lines = {}
+    current_added_lines = set()
     annotated_lines = []
     new_line_no = None
 
     def flush_file():
         if current_file and annotated_lines:
             file_line_map[current_file] = current_lines
+            added_line_map[current_file] = current_added_lines
             annotated_blocks.append(f"■ ファイル: {current_file}\n" + "\n".join(annotated_lines))
 
     for raw_line in diff_content.splitlines():
         if raw_line.startswith("diff --git "):
             flush_file()
-            current_file, current_lines, annotated_lines, new_line_no = None, {}, [], None
+            current_file, current_lines, current_added_lines, annotated_lines, new_line_no = None, {}, set(), [], None
         elif raw_line.startswith("+++ "):
             path = raw_line[4:].strip()
             current_file = None if path == "/dev/null" else re.sub(r"^[ab]/", "", path)
@@ -125,6 +130,7 @@ def analyze_diff(diff_content):
         elif current_file is not None and new_line_no is not None:
             if raw_line.startswith("+"):
                 current_lines[new_line_no] = raw_line[1:]
+                current_added_lines.add(new_line_no)
                 annotated_lines.append(f"{new_line_no:>5}+ {raw_line[1:]}")
                 new_line_no += 1
             elif raw_line.startswith("-"):
@@ -137,7 +143,81 @@ def analyze_diff(diff_content):
                 annotated_lines.append(raw_line)
 
     flush_file()
-    return file_line_map, "\n\n".join(annotated_blocks), is_truncated
+    return file_line_map, added_line_map, "\n\n".join(annotated_blocks), is_truncated
+
+def run_static_analysis(added_line_map):
+    """
+    変更されたPythonファイルに対して ruff (lint) と mypy (型チェック) を実行し、
+    このPRで実際に追加された行に絞って、AIの findings と同じ形式の指摘リストを返します。
+    ツール自体が存在しない/失敗した場合は警告を出すだけでスキップします（レビュー全体は継続）。
+    """
+    py_files = [f for f in added_line_map if f.endswith(".py") and os.path.isfile(f)]
+    if not py_files:
+        return []
+
+    findings = []
+
+    # --- ruff (lint) ---
+    try:
+        result = subprocess.run(
+            ["ruff", "check", "--select=E,W,F,B,S,SIM,C4", "--output-format=json", *py_files],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.stdout.strip():
+            for item in json.loads(result.stdout):
+                file_path = os.path.relpath(item.get("filename", "")).replace(os.sep, "/")
+                line = item.get("location", {}).get("row")
+                if line in added_line_map.get(file_path, set()):
+                    code = item.get("code", "?")
+                    if re.match(r"^S\d", code):
+                        severity = "high"  # flake8-bandit: セキュリティ上の懸念
+                    elif code.startswith("B"):
+                        severity = "medium"  # flake8-bugbear: バグになりやすいパターン
+                    else:
+                        severity = "low"
+                    findings.append({
+                        "file": file_path,
+                        "line": line,
+                        "severity": severity,
+                        "title": f"[ruff:{code}] {item.get('message', '')}",
+                        "body": f"静的解析ツール `ruff` による自動検出です（ルール: `{code}`）。"
+                    })
+    except FileNotFoundError:
+        print("Warning: ruffが見つかりません。requirements.txtへの追加を確認してください。")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        print(f"Warning: ruffの実行結果を処理できませんでした: {e}")
+
+    # --- mypy (型チェック) ---
+    try:
+        result = subprocess.run(
+            ["mypy", "--ignore-missing-imports", "--follow-imports=silent",
+             "--no-error-summary", "--show-column-numbers", *py_files],
+            capture_output=True, text=True, timeout=120
+        )
+        pattern = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?:\d+:)?\s*(?P<level>error|warning|note):\s*(?P<message>.+)$")
+        for line_out in result.stdout.splitlines():
+            m = pattern.match(line_out)
+            if not m:
+                continue
+            file_path = os.path.relpath(m.group("file")).replace(os.sep, "/")
+            line = int(m.group("line"))
+            if line in added_line_map.get(file_path, set()):
+                level = m.group("level")
+                findings.append({
+                    "file": file_path,
+                    "line": line,
+                    "severity": "medium" if level == "error" else "low",
+                    "title": f"[mypy:{level}] 型チェック",
+                    "body": f"静的解析ツール `mypy` による自動検出です。\n\n{m.group('message')}"
+                })
+    except FileNotFoundError:
+        print("Warning: mypyが見つかりません。requirements.txtへの追加を確認してください。")
+    except subprocess.TimeoutExpired as e:
+        print(f"Warning: mypyの実行がタイムアウトしました: {e}")
+
+    if findings:
+        print(f"静的解析で {len(findings)} 件の指摘を検出しました（ruff/mypy）。")
+    return findings
 
 def generate_review(title, pr_body, annotated_diff, repo_tree, model_name, api_key, base_url=None):
     """OpenAI API（または大学等のプロキシAPI）を呼び出し、指摘事項をJSON構造で取得します。"""
@@ -338,7 +418,7 @@ def main():
         sys.exit(0)
 
     repo_tree = get_repo_tree(github_repository, github_token, head_sha)
-    file_line_map, annotated_diff, is_truncated = analyze_diff(diff_content)
+    file_line_map, added_line_map, annotated_diff, is_truncated = analyze_diff(diff_content)
 
     review_data, raw_fallback_text = generate_review(
         title, pr_body, annotated_diff, repo_tree, model_name, openai_api_key, openai_base_url
@@ -347,6 +427,10 @@ def main():
     if review_data is None:
         post_issue_comment(github_repository, pr_number, github_token, raw_fallback_text or "レビュー結果の取得に失敗しました。")
         return
+
+    if os.getenv("ENABLE_STATIC_ANALYSIS", "true").lower() != "false":
+        static_findings = run_static_analysis(added_line_map)
+        review_data["findings"] = (review_data.get("findings") or []) + static_findings
 
     body, comments = build_review_comments(review_data, file_line_map)
     if is_truncated:

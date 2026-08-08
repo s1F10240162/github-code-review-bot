@@ -76,6 +76,15 @@ env:
 ### OpenAI APIのエンドポイント変更 (`OPENAI_BASE_URL`)
 デフォルトでは INIAD AI MOP API (`https://api.openai.iniad.org/api/v1`) が使用されます。通常のOpenAI公式APIやその他のプロキシを使いたい場合は、リポジトリの Secrets に `OPENAI_BASE_URL` を追加してください。
 
+### 静的解析 (ruff / mypy) との併用
+AI（LLM）は曖昧な変数名や未使用引数のような機械的なルール違反を見落とすことがあります。そのため、PRで変更された **Pythonファイル (`.py`)** に対しては、AIレビューとは別に `ruff` (lint) と `mypy` (型チェック) を実行し、その結果もインラインコメントとして統合しています。
+
+- `ruff` は `E, W, F, B, S, SIM, C4` ルールを検査します（`S`はセキュリティ関連ルールで severity: high、`B`はバグになりやすいパターンで severity: medium、それ以外は low として投稿されます）。
+- `mypy` は `--ignore-missing-imports` 付きで実行するため、対象リポジトリの依存パッケージが未インストールでもある程度動作しますが、依存関係を解決できないぶん誤検知（false positive）が増えることがあります。ノイズが多い場合は無視してください。
+- どちらも **このPRで実際に追加された行** に絞ってコメントします（既存コードの指摘はしません）。
+- Python以外の言語（TypeScriptなど）は現時点では対象外です。
+- 不要な場合は、`code-review.yml` の `env` に `ENABLE_STATIC_ANALYSIS: 'false'` を追加すると無効化できます。
+
 ---
 
 ## 👥 チーム開発での利用について
