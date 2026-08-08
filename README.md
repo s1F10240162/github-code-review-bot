@@ -1,6 +1,6 @@
 # 🤖 GitHub Actions AI Code Review BOT (OpenAI API)
 
-GitHubのPull Request (PR) が作成・更新された際に、OpenAI API (GPT-4o / GPT-4o-mini) を使って自動でコードレビューを行い、コメントを投稿するBotの構築キットです。
+GitHubのPull Request (PR) が作成・更新された際に、OpenAI API (GPT-4o / GPT-4o-mini) を使って自動でコードレビューを行うBotの構築キットです。全体サマリーを1件のコメントにまとめるのではなく、指摘事項ごとに該当コード行への **インラインコメント** として投稿します（CodeRabbit等と同様のスタイル）。
 
 ---
 
@@ -51,7 +51,7 @@ GitHub ActionsがPRにコメントを書き込めるように権限を設定し�
 
 1. 新しいブランチを作成し、適当なコード変更（または追加）を行います。
 2. そのブランチから Pull Request を作成します。
-3. GitHub Actions が自動で起動し、数十秒〜1分程度で **AI Code Review コメント** がPRに自動追加されます！
+3. GitHub Actions が自動で起動し、数十秒〜1分程度で **AI Code Review** がPRに投稿されます。全体サマリーはレビュー本文に、指摘事項は該当行への**インラインコメント**として表示されます（"Files changed" タブで確認してください）。
 
 ---
 
@@ -70,6 +70,8 @@ env:
 
 ### レビュー観点（プロンプト）の調整
 ワークフローは常に本リポジトリの `src/review_pr.py` を取得して実行するため、導入先リポジトリで直接編集しても反映されません。プロジェクト固有のコーディング規約（例: TypeScriptの型指定チェック、テストコード必須化など）に合わせてレビュー内容をカスタマイズしたい場合は、本リポジトリをフォークし、[review_pr.py](file:///C:/Users/iniad/Documents/github-code-review-bot/src/review_pr.py) 内の `system_prompt` を編集した上で、導入先の `code-review.yml` 内の参照先 (`s1F10240162/github-code-review-bot` の箇所、2か所) を自分のフォーク先に書き換えてください。
+
+`system_prompt` はAIの出力をJSON形式（`summary` / `good_points` / `findings` / `needs_clarification`）に固定した上で、`build_review_comments()` がそのJSONをインラインコメントへ変換しています。プロンプトの文面（トーン・観点）は自由に調整できますが、**JSONスキーマ自体を変更する場合は `build_review_comments()` 側の対応する処理も合わせて修正してください**。JSONの解析に失敗した場合は自動的に通常のコメント投稿にフォールバックします。
 
 ### OpenAI APIのエンドポイント変更 (`OPENAI_BASE_URL`)
 デフォルトでは INIAD AI MOP API (`https://api.openai.iniad.org/api/v1`) が使用されます。通常のOpenAI公式APIやその他のプロキシを使いたい場合は、リポジトリの Secrets に `OPENAI_BASE_URL` を追加してください。
