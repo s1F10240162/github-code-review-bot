@@ -125,7 +125,7 @@ def post_comment_to_pr(repo, pr_number, token, comment_body):
 
 def main():
     openai_api_key = get_env_variable("OPENAI_API_KEY")
-    openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.iniad.org/api/v1")
+    openai_base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.iniad.org/api/v1"
     github_token = get_env_variable("GITHUB_TOKEN")
     github_repository = get_env_variable("GITHUB_REPOSITORY")
     

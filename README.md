@@ -22,11 +22,11 @@ github-code-review-bot/
 
 ## 🛠️ 導入手順（3ステップ）
 
-### ステップ 1: ファイルの配置
-作成したいGitHubリポジトリのルートに、本フォルダ内の以下のファイル・フォルダをコピーしてコミット＆プッシュします。
+### ステップ 1: ワークフローファイルの配置
+導入したいGitHubリポジトリのルートに、以下の1ファイルのみをコピーしてコミット＆プッシュします。
 - `.github/workflows/code-review.yml`
-- `src/review_pr.py`
-- `requirements.txt`
+
+このワークフローは実行のたびに本リポジトリ (`s1F10240162/github-code-review-bot`) から `src/review_pr.py` と `requirements.txt` を自動取得して実行するため、`src/` や `requirements.txt` を導入先にコピーする必要はありません（コピーしても実行時には使用されません）。
 
 ### ステップ 2: OpenAI APIキーのセットアップ
 1. [OpenAI Platform](https://platform.openai.com/api-keys) で API Key を発行します。
@@ -66,7 +66,10 @@ env:
 - **`gpt-4o`**: より複雑な設計思考や深いバグ検出を行いたい場合におすすめ。
 
 ### レビュー観点（プロンプト）の調整
-[review_pr.py](file:///C:/Users/iniad/Documents/github-code-review-bot/src/review_pr.py) 内の `system_prompt` を編集することで、プロジェクト固有のコーディング規約（例: TypeScriptの型指定チェック、テストコード必須化など）に合わせたレビューを行わせることができます。
+ワークフローは常に本リポジトリの `src/review_pr.py` を取得して実行するため、導入先リポジトリで直接編集しても反映されません。プロジェクト固有のコーディング規約（例: TypeScriptの型指定チェック、テストコード必須化など）に合わせてレビュー内容をカスタマイズしたい場合は、本リポジトリをフォークし、[review_pr.py](file:///C:/Users/iniad/Documents/github-code-review-bot/src/review_pr.py) 内の `system_prompt` を編集した上で、導入先の `code-review.yml` 内の参照先 (`s1F10240162/github-code-review-bot` の箇所、2か所) を自分のフォーク先に書き換えてください。
+
+### OpenAI APIのエンドポイント変更 (`OPENAI_BASE_URL`)
+デフォルトでは INIAD AI MOP API (`https://api.openai.iniad.org/api/v1`) が使用されます。通常のOpenAI公式APIやその他のプロキシを使いたい場合は、リポジトリの Secrets に `OPENAI_BASE_URL` を追加してください。
 
 ---
 
