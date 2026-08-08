@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import requests
@@ -8,6 +9,9 @@ MAX_DIFF_LENGTH = 20000  # トークン超過を防ぐための文字数上限
 MAX_TREE_ENTRIES = 300   # リポジトリ構成として送るファイル数の上限
 MAX_TREE_LENGTH = 4000   # リポジトリ構成として送る文字数の上限
 IGNORE_TREE_PREFIXES = (".git/", "node_modules/", "dist/", "build/", "__pycache__/", ".venv/", "venv/")
+
+SEVERITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🔵"}
+SEVERITY_LABEL = {"high": "優先度: 高", "medium": "優先度: 中", "low": "優先度: 低"}
 
 def get_env_variable(var_name, default=None, required=True):
     val = os.getenv(var_name, default)
@@ -23,7 +27,7 @@ def get_pr_details(repo, pr_number, token):
         "Accept": "application/vnd.github.v3.diff",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    
+
     # 差分の取得
     diff_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     response = requests.get(diff_url, headers=headers)
@@ -80,36 +84,99 @@ def get_repo_tree(repo, token, ref):
         tree_text = tree_text[:MAX_TREE_LENGTH] + "\n... (構成情報が長すぎるため一部省略)"
     return tree_text
 
-def generate_review(title, pr_body, diff_content, repo_tree, model_name, api_key, base_url=None):
-    """OpenAI API（または大学等のプロキシAPI）を呼び出してコードレビュー結果を生成します。"""
+def analyze_diff(diff_content):
+    """
+    Diffを解析し、
+    (1) インラインコメント可能な (ファイルパス, 新ファイル側の行番号) の集合
+    (2) 行番号付きでAIに提示するための整形済みテキスト
+    を作成します。行番号は新ファイル側 (追加行・変更なしの周辺行) のみ付与され、
+    削除された行にはコメントできないため番号を付けません。
+    """
+    is_truncated = len(diff_content) > MAX_DIFF_LENGTH
+    if is_truncated:
+        diff_content = diff_content[:MAX_DIFF_LENGTH]
+
+    file_line_map = {}
+    annotated_blocks = []
+
+    current_file = None
+    current_lines = {}
+    annotated_lines = []
+    new_line_no = None
+
+    def flush_file():
+        if current_file and annotated_lines:
+            file_line_map[current_file] = current_lines
+            annotated_blocks.append(f"■ ファイル: {current_file}\n" + "\n".join(annotated_lines))
+
+    for raw_line in diff_content.splitlines():
+        if raw_line.startswith("diff --git "):
+            flush_file()
+            current_file, current_lines, annotated_lines, new_line_no = None, {}, [], None
+        elif raw_line.startswith("+++ "):
+            path = raw_line[4:].strip()
+            current_file = None if path == "/dev/null" else re.sub(r"^[ab]/", "", path)
+        elif raw_line.startswith("@@"):
+            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw_line)
+            if match:
+                new_line_no = int(match.group(1))
+            if current_file:
+                annotated_lines.append(raw_line)
+        elif current_file is not None and new_line_no is not None:
+            if raw_line.startswith("+"):
+                current_lines[new_line_no] = raw_line[1:]
+                annotated_lines.append(f"{new_line_no:>5}+ {raw_line[1:]}")
+                new_line_no += 1
+            elif raw_line.startswith("-"):
+                annotated_lines.append(f"      - {raw_line[1:]}")
+            elif raw_line.startswith(" "):
+                current_lines[new_line_no] = raw_line[1:]
+                annotated_lines.append(f"{new_line_no:>5}  {raw_line[1:]}")
+                new_line_no += 1
+            else:
+                annotated_lines.append(raw_line)
+
+    flush_file()
+    return file_line_map, "\n\n".join(annotated_blocks), is_truncated
+
+def generate_review(title, pr_body, annotated_diff, repo_tree, model_name, api_key, base_url=None):
+    """OpenAI API（または大学等のプロキシAPI）を呼び出し、指摘事項をJSON構造で取得します。"""
     if base_url:
         print(f"カスタムBase URLを使用中: {base_url}")
         client = OpenAI(api_key=api_key, base_url=base_url)
     else:
         client = OpenAI(api_key=api_key)
 
-    is_truncated = False
-    if len(diff_content) > MAX_DIFF_LENGTH:
-        diff_content = diff_content[:MAX_DIFF_LENGTH] + "\n\n... (差分が長すぎるため一部省略されました)"
-        is_truncated = True
-
     system_prompt = """あなたは経験豊富なシニアソフトウェアエンジニア兼コードレビュアーです。
-提出されたPull Requestの変更差分(Diff)を、リポジトリ全体のディレクトリ構成やPRの説明（意図）と照らし合わせながら分析し、以下のガイドラインに従って日本語でコードレビューを行ってください。
+提出されたPull Requestの変更を、リポジトリ全体のディレクトリ構成やPRの説明（意図）と照らし合わせながら分析し、必ず下記のJSON形式のみで日本語のレビュー結果を出力してください。前後に説明文やコードフェンスは付けないでください。
 
-【コンテキストの扱い方】
-- 「リポジトリ構成」が提供されている場合は、変更が既存の設計・ファイル配置・命名規則に沿っているか（置き場所の妥当性、既存モジュールとの重複がないか等）を確認材料にしてください。
-- PRの説明が「説明なし」またはごく簡素で意図が読み取れない場合、憶測で断定した評価をせず、改善・懸念事項の中で「⚠️ 意図の確認: 背景・目的をPR概要に追記してください」と一言添えてください。特にコードの一部分だけを機械的に差し替えたように見える変更は、周辺ファイルや呼び出し元との整合性を慎重に確認してください。
+【入力形式】
+「変更差分」はファイルごとに、行番号付きで渡されます。行番号があるのは追加行・変更なしの周辺行のみで、削除された行(行頭が `-`)には行番号がなくコメントできません。
 
-【レビュー項目・フォーマット】
-1. 📝 **変更概要のサマリー**: 何が変更されたかを簡潔に要約してください。
-2. 🌟 **良かった点**: コードの品質、設計、テスト、命名規則など優れている点を褒めてください。
-3. ⚠️ **改善・懸念事項**:
-   - 🔴 **【優先度: 高】** バグの可能性、セキュリティ上の脆弱性、重大なパフォーマンストラブル
-   - 🟡 **【優先度: 中】** 可読性・保守性の低下、例外処理の不足、エッジケースの考慮漏れ、既存のディレクトリ構成・命名規則との不整合
-   - 🔵 **【優先度: 低】** 軽微なリファクタリング提案、命名の改善、タイポなど
-4. 💡 **具体的な修正提案**: 改善点がある場合は、Markdownのコードブロック形式で修正後のコード例を提示してください。
+【出力JSONスキーマ】
+{
+  "summary": "変更概要のサマリー (文字列)",
+  "good_points": ["良かった点", ...],
+  "findings": [
+    {
+      "file": "変更差分に登場したファイルパスと完全一致させる",
+      "line": 対象行番号(変更差分に付与された番号と完全一致する整数。削除行や存在しない行は指定不可),
+      "severity": "high" または "medium" または "low",
+      "title": "指摘の短い見出し",
+      "body": "具体的な指摘内容。必要ならMarkdownのコードブロックで修正案を含める。"
+    }
+  ],
+  "needs_clarification": "PRの説明が薄く意図が読み取れない場合にその旨を書く文字列。問題なければ空文字列。"
+}
 
-※ 建設的で丁寧なトーンで回答してください。大きな問題がなければ「問題なし」と評価し、リリースを後押ししてください。
+【レビュー方針】
+- 「リポジトリ構成」を参考に、変更が既存の設計・ファイル配置・命名規則と整合しているか確認してください。
+- バグの可能性・セキュリティ上の脆弱性・重大なパフォーマンス問題は severity: "high"。
+- 可読性・保守性の低下、例外処理の不足、エッジケースの考慮漏れ、構成との不整合は severity: "medium"。
+- 軽微なリファクタリング提案、命名の改善、タイポは severity: "low"。
+- 特定の行に紐づかない、ファイル全体・設計全体への指摘は findings に入れず summary に書いてください。
+- 大きな問題がなければ findings は空配列にし、summary で「問題なし」と評価してリリースを後押ししてください。
+- 建設的で丁寧なトーンで記述してください。
 """
 
     repo_tree_section = f"""
@@ -119,16 +186,14 @@ def generate_review(title, pr_body, diff_content, repo_tree, model_name, api_key
 ```
 """ if repo_tree else ""
 
-    user_prompt = f"""以下はレビュー対象のPull Request情報です。
+    user_prompt = f"""以下はレビュー対象のPull Request情報です。JSON形式で回答してください。
 
 ■ PRタイトル: {title}
 ■ PR概要:
 {pr_body}
 {repo_tree_section}
-■ 変更差分 (Git Diff):
-```diff
-{diff_content}
-```
+■ 変更差分 (ファイルごとに行番号付き。番号がある行のみコメント可能):
+{annotated_diff}
 """
 
     print(f"モデル '{model_name}' を使用してレビューを生成中...")
@@ -140,34 +205,102 @@ def generate_review(title, pr_body, diff_content, repo_tree, model_name, api_key
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
-        review_text = response.choices[0].message.content
-        if is_truncated:
-            review_text += "\n\n> ⚠️ **注意**: 差分量が多いため、一部の変更箇所は省略してレビューされました。"
-        return review_text
+        raw_text = response.choices[0].message.content
     except Exception as e:
         print(f"Error: OpenAI API呼び出しに失敗しました: {e}")
         sys.exit(1)
 
-def post_comment_to_pr(repo, pr_number, token, comment_body):
-    """PRにコメントを投稿します。"""
+    try:
+        return json.loads(raw_text), None
+    except (json.JSONDecodeError, TypeError):
+        print("Warning: レビュー結果をJSONとして解析できませんでした。通常コメントにフォールバックします。")
+        return None, raw_text
+
+def build_review_comments(review_data, file_line_map):
+    """AIのJSON出力を、レビュー本文(body)とインラインコメント配列(comments)に変換します。"""
+    summary = review_data.get("summary") or "（サマリーがありません）"
+    good_points = review_data.get("good_points") or []
+    findings = review_data.get("findings") or []
+    needs_clarification = review_data.get("needs_clarification") or ""
+
+    body_parts = [f"### 📝 変更概要のサマリー\n{summary}"]
+    if good_points:
+        body_parts.append("### 🌟 良かった点\n" + "\n".join(f"- {p}" for p in good_points))
+    if needs_clarification:
+        body_parts.append(f"### ⚠️ 意図の確認\n{needs_clarification}")
+
+    comments = []
+    skipped = []
+    for finding in findings:
+        file_path = finding.get("file")
+        try:
+            line = int(finding.get("line"))
+        except (TypeError, ValueError):
+            line = None
+        severity = finding.get("severity", "low")
+        title = finding.get("title", "指摘事項")
+        detail = finding.get("body", "")
+        icon = SEVERITY_ICON.get(severity, "🔵")
+        label = SEVERITY_LABEL.get(severity, "優先度: 低")
+        comment_body = f"{icon} **【{label}】{title}**\n\n{detail}"
+
+        if file_path in file_line_map and line in file_line_map.get(file_path, {}):
+            comments.append({"path": file_path, "line": line, "side": "RIGHT", "body": comment_body})
+        else:
+            skipped.append((file_path, line, comment_body))
+
+    if skipped:
+        skipped_text = "\n\n".join(
+            f"- `{f or '不明なファイル'}`" + (f" (行 {l})" if l else "") + f"\n  {b}"
+            for f, l, b in skipped
+        )
+        body_parts.append(f"### 📌 その他の指摘（該当行を特定できなかったもの）\n{skipped_text}")
+
+    return "\n\n".join(body_parts), comments
+
+def post_review(repo, pr_number, token, commit_id, body, comments):
+    """PRに、行ごとのインラインコメントを含むレビューを投稿します。"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    review_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews"
+    payload = {
+        "commit_id": commit_id,
+        "body": f"🤖 **AI Code Review (OpenAI)**\n\n{body}",
+        "event": "COMMENT",
+        "comments": comments
+    }
+
+    response = requests.post(review_url, headers=headers, data=json.dumps(payload))
+    if response.status_code not in (200, 201):
+        print(f"Error: レビューの投稿に失敗しました (Status: {response.status_code}): {response.text}")
+        sys.exit(1)
+
+    print(f"Success: PR #{pr_number} に指摘 {len(comments)} 件を含むレビューを投稿しました！")
+
+def post_issue_comment(repo, pr_number, token, comment_body):
+    """(フォールバック用) PRに通常のコメントを1件投稿します。"""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
     comment_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
-    
+
     payload = {
         "body": f"🤖 **AI Code Review (OpenAI)**\n\n{comment_body}"
     }
-    
+
     response = requests.post(comment_url, headers=headers, data=json.dumps(payload))
-    if response.status_code not in [200, 201]:
+    if response.status_code not in (200, 201):
         print(f"Error: PRへのコメント投稿に失敗しました (Status: {response.status_code}): {response.text}")
         sys.exit(1)
-    
+
     print(f"Success: PR #{pr_number} にコードレビューを正常に投稿しました！")
 
 def main():
@@ -175,7 +308,7 @@ def main():
     openai_base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.iniad.org/api/v1"
     github_token = get_env_variable("GITHUB_TOKEN")
     github_repository = get_env_variable("GITHUB_REPOSITORY")
-    
+
     # GITHUB_EVENT_PATH から PR番号の取得を試みる (Actions環境)
     pr_number = os.getenv("PR_NUMBER")
     if not pr_number:
@@ -205,9 +338,21 @@ def main():
         sys.exit(0)
 
     repo_tree = get_repo_tree(github_repository, github_token, head_sha)
+    file_line_map, annotated_diff, is_truncated = analyze_diff(diff_content)
 
-    review_result = generate_review(title, pr_body, diff_content, repo_tree, model_name, openai_api_key, openai_base_url)
-    post_comment_to_pr(github_repository, pr_number, github_token, review_result)
+    review_data, raw_fallback_text = generate_review(
+        title, pr_body, annotated_diff, repo_tree, model_name, openai_api_key, openai_base_url
+    )
+
+    if review_data is None:
+        post_issue_comment(github_repository, pr_number, github_token, raw_fallback_text or "レビュー結果の取得に失敗しました。")
+        return
+
+    body, comments = build_review_comments(review_data, file_line_map)
+    if is_truncated:
+        body += "\n\n> ⚠️ **注意**: 差分量が多いため、一部の変更箇所は省略してレビューされました。"
+
+    post_review(github_repository, pr_number, github_token, head_sha, body, comments)
 
 if __name__ == "__main__":
     main()
