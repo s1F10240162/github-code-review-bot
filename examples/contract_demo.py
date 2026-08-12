@@ -1,7 +1,3 @@
-"""
-動作確認用のサンプル: APIの「契約」(リクエスト/レスポンスの形) を表すエンドポイント。
-このファイルはAIレビューBotの契約変更検知ルールをテストするために使われます。
-"""
 from fastapi import FastAPI
 from pydantic import BaseModel
 
