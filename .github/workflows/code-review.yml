@@ -3,6 +3,8 @@ name: AI Code Reviewer (OpenAI)
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  pull_request_review_comment:
+    types: [created]
   workflow_call:
     secrets:
       OPENAI_API_KEY:
