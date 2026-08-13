@@ -12,6 +12,7 @@ IGNORE_TREE_PREFIXES = (".git/", "node_modules/", "dist/", "build/", "__pycache_
 
 SEVERITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🔵"}
 SEVERITY_LABEL = {"high": "優先度: 高", "medium": "優先度: 中", "low": "優先度: 低"}
+BOT_LOGIN = "github-actions[bot]"
 
 def get_env_variable(var_name, default=None, required=True):
     val = os.getenv(var_name, default)
@@ -171,7 +172,7 @@ def generate_review(title, pr_body, annotated_diff, repo_tree, model_name, api_k
 
 【レビュー方針】
 - 「リポジトリ構成」を参考に、変更が既存の設計・ファイル配置・命名規則と整合しているか確認してください。
-- API等の公開インターフェースの定義（例: FastAPIやFlaskのエンドポイント定義、リクエスト/レスポンスに使われるスキーマ・型定義クラス、GraphQLのスキーマなど）で、フィールドの追加・削除・名称変更・型変更・必須/任意の変更を検知した場合は、それを「APIの契約変更」とみなしてください。変更前後のフィールド構成の差分を具体的に明記し（同じ差分内でフィールドの削除と追加が両方見られる場合はリネームの可能性にも触れてください）、severity: "high"とした上で「この変更を利用している側（フロントエンド等の呼び出しコードや型定義）も合わせて更新されているか確認してください」という趣旨の一言を添えてください。ただし、このPRの差分だけでは呼び出し側の実装は見えないため、断定的に「壊れている」と決めつけず、確認を促す書き方にしてください。
+- API等の公開インターフェースの定義（例: FastAPIやFlaskのエンドポイント定義、リクエスト/レスポンスに使われるスキーマ・型定義クラス、GraphQLのスキーマなど）で、フィールドの追加・削除・名称変更・型変更・必須/任意の変更を検知した場合は、それを「APIの契約変更」とみなしてください。**このルールは、HTTPエンドポイントのハンドラ関数（`@app.get`/`@app.post`/`@app.route`等のデコレータが付いた関数）や、リクエスト/レスポンスのスキーマクラス（Pydanticの`BaseModel`を継承したクラス、GraphQLの型定義など）自体の変更にのみ適用してください。それらのデコレータやスキーマ定義を伴わない、単なる内部処理用の関数・ヘルパー関数の追加や引数変更は対象外です（外部から呼び出されるインターフェースではないため）。** 該当する場合は、変更前後のフィールド構成の差分を具体的に明記し（同じ差分内でフィールドの削除と追加が両方見られる場合はリネームの可能性にも触れてください）、severity: "high"とした上で「この変更を利用している側（フロントエンド等の呼び出しコードや型定義）も合わせて更新されているか確認してください」という趣旨の一言を添えてください。ただし、このPRの差分だけでは呼び出し側の実装は見えないため、断定的に「壊れている」と決めつけず、確認を促す書き方にしてください。
 - バグの可能性・セキュリティ上の脆弱性・重大なパフォーマンス問題は severity: "high"。
 - 可読性・保守性の低下、例外処理の不足、エッジケースの考慮漏れ、構成との不整合は severity: "medium"。
 - 軽微なリファクタリング提案、命名の改善、タイポは severity: "low"。
@@ -304,11 +305,149 @@ def post_issue_comment(repo, pr_number, token, comment_body):
 
     print(f"Success: PR #{pr_number} にコードレビューを正常に投稿しました！")
 
+def get_all_review_comments(repo, pr_number, token):
+    """PRに付いている全てのインラインレビューコメント（返信含む）を取得します。"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    comments = []
+    page = 1
+    while True:
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments"
+        response = requests.get(url, headers=headers, params={"per_page": 100, "page": page})
+        if response.status_code != 200:
+            print(f"Warning: レビューコメントの取得に失敗しました (Status: {response.status_code})。")
+            break
+        batch = response.json()
+        if not batch:
+            break
+        comments.extend(batch)
+        page += 1
+    return comments
+
+def build_thread_context(all_comments, root_id):
+    """指定されたスレッド(root_idへの返信一式)を、時系列順の会話テキストに整形します。"""
+    root_comment = next((c for c in all_comments if c.get("id") == root_id), None)
+    if root_comment is None:
+        return None, ""
+
+    thread = [root_comment] + [
+        c for c in all_comments
+        if c.get("in_reply_to_id") == root_id and c.get("id") != root_id
+    ]
+    thread.sort(key=lambda c: c.get("created_at", ""))
+
+    lines = []
+    for c in thread:
+        speaker = "🤖 AIレビュアー" if c.get("user", {}).get("login") == BOT_LOGIN else f"👤 {c.get('user', {}).get('login', '不明')}"
+        lines.append(f"[{speaker}]\n{c.get('body', '')}")
+    return root_comment, "\n\n".join(lines)
+
+def generate_reply(root_comment, thread_text, latest_reply_body, model_name, api_key, base_url=None):
+    """指摘へのスレッド内での返信を読み、AIとしての応答を1件生成します（自由記述、JSON化しない）。"""
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+
+    system_prompt = """あなたは経験豊富なシニアソフトウェアエンジニア兼コードレビュアーです。
+以前あなたが投稿したコードレビューの指摘に対して、PRの作成者や他の開発者から返信が届きました。
+スレッドの会話履歴を踏まえ、その返信に対する応答を1件、日本語の自然な文章で簡潔に返してください。
+JSON化やMarkdownの見出しは不要です。相手の発言に直接答える、短い会話文として書いてください。
+
+【応答方針】
+- 相手の説明が妥当で、指摘への対応が不要と判断できる場合は、素直にそれを認めてください。
+- まだ懸念が残る場合は、何が引っかかっているのかを具体的かつ簡潔に説明してください。
+- 元の指摘をそのまま繰り返さないでください。会話の続きとして自然に応答してください。
+- 過度に長くならないよう、2〜4文程度を目安にしてください。
+"""
+
+    user_prompt = f"""■ 対象ファイル: {root_comment.get("path")} (行 {root_comment.get("line") or root_comment.get("original_line")})
+■ 該当コードの差分:
+{root_comment.get("diff_hunk", "")}
+
+■ これまでの会話:
+{thread_text}
+
+■ 直近の返信（これに応答してください）:
+{latest_reply_body}
+"""
+
+    print(f"モデル '{model_name}' を使用して返信を生成中...")
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error: OpenAI API呼び出しに失敗しました: {e}")
+        sys.exit(1)
+
+def post_reply(repo, pr_number, comment_id, token, body):
+    """既存のレビューコメントスレッドに返信を投稿します。"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments/{comment_id}/replies"
+    payload = {"body": f"🤖 {body}"}
+
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    if response.status_code not in (200, 201):
+        print(f"Error: 返信の投稿に失敗しました (Status: {response.status_code}): {response.text}")
+        sys.exit(1)
+
+    print(f"Success: PR #{pr_number} のスレッドに返信しました。")
+
+def handle_review_comment_reply(github_repository, github_token, openai_api_key, openai_base_url, model_name):
+    """pull_request_review_commentイベント(誰かがコメントに返信した)を処理します。"""
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    if not event_path or not os.path.exists(event_path):
+        print("Error: イベント情報(GITHUB_EVENT_PATH)が見つかりませんでした。")
+        sys.exit(1)
+
+    with open(event_path, "r", encoding="utf-8") as f:
+        event_data = json.load(f)
+
+    comment = event_data.get("comment", {})
+    pr_number = event_data.get("pull_request", {}).get("number")
+
+    if comment.get("user", {}).get("login") == BOT_LOGIN:
+        print("Bot自身のコメントのため、返信をスキップします（無限ループ防止）。")
+        return
+
+    in_reply_to_id = comment.get("in_reply_to_id")
+    if not in_reply_to_id:
+        print("既存スレッドへの返信ではない（新規コメント）ため、スキップします。")
+        return
+
+    all_comments = get_all_review_comments(github_repository, pr_number, github_token)
+    root_comment, thread_text = build_thread_context(all_comments, in_reply_to_id)
+
+    if root_comment is None or root_comment.get("user", {}).get("login") != BOT_LOGIN:
+        print("Botが開始したスレッドではないため、返信をスキップします。")
+        return
+
+    reply_text = generate_reply(
+        root_comment, thread_text, comment.get("body", ""), model_name, openai_api_key, openai_base_url
+    )
+    post_reply(github_repository, pr_number, comment["id"], github_token, reply_text)
+
 def main():
     openai_api_key = get_env_variable("OPENAI_API_KEY")
     openai_base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.iniad.org/api/v1"
     github_token = get_env_variable("GITHUB_TOKEN")
     github_repository = get_env_variable("GITHUB_REPOSITORY")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if os.getenv("GITHUB_EVENT_NAME") == "pull_request_review_comment":
+        handle_review_comment_reply(github_repository, github_token, openai_api_key, openai_base_url, model_name)
+        return
 
     # GITHUB_EVENT_PATH から PR番号の取得を試みる (Actions環境)
     pr_number = os.getenv("PR_NUMBER")
@@ -323,8 +462,6 @@ def main():
     if not pr_number:
         print("Error: PR番号(PR_NUMBER)が見つかりませんでした。")
         sys.exit(1)
-
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     print(f"--- AI Code Review 開始 ---")
     print(f"リポジトリ: {github_repository}")
